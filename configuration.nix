@@ -1,23 +1,61 @@
+# Edit this configuration file to define what should be installed on
+# your system. Help is available in the configuration.nix(5) man page, on
+# https://search.nixos.org/options and in the NixOS manual (`nixos-help`).
+
 { config, lib, pkgs, inputs, ... }:
 
 {
-  imports = [
+  imports =
+    [ # Include the results of the hardware scan.
       ./hardware-configuration.nix
     ];
 
-  ##############
-  # Bootloader #
-  ##############
   boot = {
+    initrd = {
+      # Systemd
+      systemd.enable = true;
+
+      # To get Plymouth worked on new Intel Xe-driver.
+      availableKernelModules = [ "xe" ];
+    };
+
+    # KVMFR Kernel Modules
+    initrd.kernelModules = [ "kvmfr" ];
+    extraModulePackages = [ config.boot.kernelPackages.kvmfr ];
+
+    # Lanzaboote
     lanzaboote = {
       enable = true;
       pkiBundle = "/var/lib/sbctl";
+    };   
+
+    loader = {
+      efi.canTouchEfiVariables = true;
+      systemd-boot.enable = lib.mkForce false; # Conflict with Lanzaboote.
     };
-    blacklistedKernelModules = [ "nouveau" ];
-    kernelPackages = pkgs.linuxPackages_cachyos-lto;
-    consoleLogLevel = 3;
+
+    # Quiet boot
+    consoleLogLevel = lib.mkForce 3;
     initrd.verbose = false;
+    loader.timeout = 0;
+    plymouth.enable = true;
+    loader.systemd-boot = {
+      editor = false;
+      configurationLimit = 10;
+      consoleMode = "2";
+    };
+
     kernelParams = [
+      # Disable all mitigations
+      "mitigations=off"
+      "nopti"
+      "tsx=on"
+      "kernel.split_lock_mitigate=0"
+
+      # Disable Watchdog
+      "nowatchdog"      
+
+      # Quiet boot
       "quiet"
       "splash"
       "loglevel=3"
@@ -25,132 +63,198 @@
       "boot.shell_on_fail"
       "udev.log_priority=3"
       "rd.systemd.show_status=auto"
+      "vt.global_cursor_default=0"
+      
+      # KVMFR
+      "kvmfr.static_size_mb=64"
+
+      # Xe-driver
       "i915.force_probe=!46a3"
       "xe.force_probe=46a3"
+
+      # Zswap
+      "zswap.enabled=0"
     ];
-    loader = {
-      timeout = 0; 
-      systemd-boot.enable = lib.mkForce false;
-      systemd-boot.consoleMode = "max";
-      efi.canTouchEfiVariables = true;
+        
+    # Fucking annoying
+    blacklistedKernelModules = [ "nouveau" "iTCO_wdt" ];
+
+    # Sysctl
+    kernel.sysctl = {
+      # Dirty Pages
+      "vm.dirty_background_bytes" = 67108864;
+      "vm.dirty_bytes" = 1073741824;
+      "vm.dirty_expire_centisecs" = 1500;
+      "vm.dirty_writeback_centisecs" = 500;
+
+      # Memory mapping
+      "vm.max_map_count" = 2147483642;
+
+      # Enable all SysRq shortcuts
+      "kernel.sysrq" = 1;
+
+      # Disable Watchdog
+      "kernel.watchdog" = 0;
+
+      # Disable Split Lock
+      "kernel.split_lock_mitigate" = 0;
+
+      # MGLRU Page Trashing
+      "vm.lru_gen_min_ttl_ms" = 2000;
     };
-    plymouth = {
-      enable = true;
-      theme = "bgrt";
+                             
+    # Kernel
+    kernelPackages = pkgs.linuxPackages_cachyos;
+  }; 
+
+  # MGLRU Page Trashing
+  systemd.tmpfiles.settings."10-mglru" = {
+    "/sys/kernel/mm/lru_gen/min_ttl_ms"."w!" = {
+      argument = "2000";
     };
   };
 
-  systemd.tmpfiles.rules = [
-    "L+ /run/gdm/.config/monitors.xml - - - - ${pkgs.writeText "gdm-monitors.xml" ''
-      <monitors version="2">
-        <configuration>
-          <layoutmode>logical</layoutmode>
-          <logicalmonitor>
-            <x>0</x>
-            <y>0</y>
-            <scale>1.25</scale>
-            <primary>yes</primary>
-            <monitor>
-              <monitorspec>
-                <connector>eDP-1</connector>
-                <vendor>CSO</vendor>
-                <product>0x1616</product>
-                <serial>0x00000000</serial>
-              </monitorspec>
-              <mode>
-                <width>2560</width>
-                <height>1600</height>
-                <rate>165.019</rate>
-              </mode>
-            </monitor>
-          </logicalmonitor>
-        </configuration>
-      </monitors>
-    ''}"
+  # Disable I/O scheduler for NVMe disks.
+  services.udev.extraRules = ''
+    ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="none"
+  '';
+      
+  # Impermanence
+  boot.initrd.systemd.services.rollback-root = {
+    description = "Rollback / subvolume to pristine state";
+    wantedBy = [ "initrd.target" ];
+    after = [ "dev-disk-by\\x2dlabel-NIXOS.device" ];
+    before = [ "sysroot.mount" ];
+    path = [ pkgs.btrfs-progs pkgs.coreutils ];
+    unitConfig.DefaultDependencies = "no";
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+
+    script = ''
+      MNT="/tmp/btrfs-root"
+      mkdir -p "$MNT"
+      mount -t btrfs -o subvol=/ /dev/disk/by-label/NIXOS "$MNT"
+
+      if [ -e "$MNT/@" ]; then
+        echo "--> Deleting old @ subvolume..."
+        btrfs subvolume delete "$MNT/@"
+      fi
+
+      echo "--> Restoring blank / from @-blank..."
+      btrfs subvolume snapshot "$MNT/@-blank" "$MNT/@"
+
+      umount "$MNT"
+      rmdir "$MNT"
+    '';
+  };
+
+  # Persistence
+  environment.persistence."/persist" = {
+    hideMounts = true;
+    directories = [
+      "/etc/nixos"
+      "/etc/ssh"
+      "/etc/NetworkManager/system-connections"
+      "/var/lib/nixos"     
+      "/var/lib/systemd"
+      "/var/lib/bluetooth"
+      "/var/lib/sbctl"
+      "/var/lib/flatpak"
+      "/var/lib/containers"
+      "/var/lib/cups"
+      { directory = "/var/lib/iwd"; mode = "u=rwx,g=,o="; }
+    ];
+    files = [
+      "/etc/machine-id"
+    ];
+    users.root = {
+      directories = [
+        { directory = ".android"; mode = "0700"; } # adb keys
+        { directory = ".gnupg"; mode = "0700"; }
+        { directory = ".ssh"; mode = "0700"; }
+      ];
+    };
+  };
+  
+  # OpenSSH
+  services.openssh.hostKeys = [
+    {
+      path = "/persist/etc/ssh/ssh_host_rsa_key";
+      type = "rsa";
+      bits = 4096;
+    }  
   ];
 
+  # MachineID
+  environment.etc."machine-id".source = "/persist/etc/machine-id";
 
-  ############
-  # Graphics #
-  ############
-  #services = {
-  #  xserver.videoDrivers = [ "nvidia" ];
-  #  switcherooControl.enable = true;
-  #};
-         
+
   hardware = {
+    # Intel microcode
     cpu.intel.updateMicrocode = true;
-    #nvidia-container-toolkit.enable = true;
+
+    # Graphics
     graphics = {
       enable = true;
       extraPackages = with pkgs; [
-        #nvidia-vaapi-driver
-        intel-media-driver
-        intel-ocl
-        intel-vaapi-driver
+	intel-media-driver
+	intel-compute-runtime
       ];
     };
+  };
 
-    #nvidia = {
-    #  modesetting.enable = true;
-    #  dynamicBoost.enable = true;
-    #  open = false;
-    #  nvidiaSettings = true;
-    #  package = config.boot.kernelPackages.nvidiaPackages.stable;
-    #  powerManagement = {
-    #    enable = true;
-    #    finegrained = true;
-    #  };
-    #  prime = {
-    #    offload = {
-    #      enable = true;
-    #      enableOffloadCmd = true;
-    #    };
-    #    intelBusId = "PCI:0:2:0"; 
-    #    nvidiaBusId = "PCI:1:0:0";
-    #  };
-    #};
-  };  
+  # LIBVA
+  environment.sessionVariables = { LIBVA_DRIVERS_NAME = "iHD"; };
+  
 
-
-
-
-  #########
-  # GNOME #
-  #########
+  # GNOME
   services = {
-    displayManager.gdm = {
-      enable = true;
-      wayland = true;
-    };
+    displayManager.gdm.enable = true;
+    desktopManager.gnome.enable = true;
+  };
 
-    desktopManager.gnome = {
-      enable = true;
-      extraGSettingsOverridePackages = [ pkgs.mutter ];
-      extraGSettingsOverrides = ''
-        [org.gnome.mutter]
-        experimental-features=['scale-monitor-framebuffer', 'variable-refresh-rate', 'xwayland-native-scaling']
-      '';
+  # To fix GDM scaling.
+  systemd.tmpfiles.settings."10-gdm-monitors" = {
+    "/run/gdm/.config/monitors.xml"."L+" = {
+      argument = "${pkgs.writeText "gdm-monitors.xml" ''
+        <monitors version="2">
+          <configuration>
+	    <layoutmode>logical</layoutmode>
+            <logicalmonitor>
+	      <x>0</x>
+              <y>0</y>
+              <scale>1.25</scale>
+              <primary>yes</primary>
+              <monitor>
+                <monitorspec>
+                  <connector>eDP-1</connector>
+                  <vendor>CS0</vendor>
+                  <product>0x1616</product>
+                  <serial>0x00000000</serial>
+                </monitorspec>
+                <mode>
+                  <width>2560</width>
+                  <height>1600</height>
+                  <rate>165.019</rate>
+                </mode>
+              </monitor>
+            </logicalmonitor>
+          </configuration>
+        </monitors>
+      ''}";
     };
   };
 
 
-
-
-  ###########
-  # Locales #
-  ###########
+  # Locales
   i18n = {
     defaultLocale = "en_US.UTF-8";
     supportedLocales = [ "all" ];
   };
-    
-  #console = {
-  #  font = "Lat2-Terminus16";
-  #  keyMap = "us";
-  #  useXkbConfig = true;
-  #};
 
+  # Fonts
   fonts.packages = with pkgs; [
     noto-fonts
     font-awesome
@@ -158,283 +262,360 @@
     noto-fonts-cjk-sans
     noto-fonts-cjk-serif
     noto-fonts-color-emoji
+    corefonts
+    vista-fonts
   ];
 
-
-
-
-  ########
-  # Time #
-  ########
+  # Timezone
   time.timeZone = "Europe/Moscow";
- 
 
 
-
-  ##############
-  # Networking #
-  ##############
+  # Networking
   networking = {
+    # Hostname
     hostName = "NixOS";
-    networkmanager.enable = true;
-    useDHCP = lib.mkForce true;
-    firewall.checkReversePath = false;
-    hosts = {
-      "127.0.0.1" = [ "localhost" ];
-      "::1" = [ "localhost" ];
-      "127.0.02" = [ "ms7996" ];
-      "50.7.85.219" = [ "inference.codeium.com" ];
-      "50.7.87.83" = [ "proxy.individual.githubcopilot.com" ];
-      "142.54.189.106" = [ "web.archive.org" ];
-      "204.12.192.220" = [ "developer.nvidia.com" ];
-      "50.7.85.222" = [ "www.canva.com" ];
-      "204.12.192.222" = [
-        "chatgpt.com"
-        "ab.chatgpt.com"
-        "auth.openai.com"
-        "auth0.openai.com"
-        "platform.openai.com"
-        "cdn.oaistatic.com"
-        "files.oaiusercontent.com"
-        "cdn.auth0.com"
-        "tcr9i.chat.openai.com"
-        "webrtc.chatgpt.com"
-        "api.openai.com"
-        "x.ai"
-        "www.x.ai"
-        "sora.com"
-        "gemini.google.com"
-        "aistudio.google.com"
-        "generativelanguage.googleapis.com"
-        "alkalimakersuite-pa.clients6.google.com"
-        "aitestkitchen.withgoogle.com"
-        "webchannel-alkalimakersuite-pa.clients6.google.com"
-        "o.pki.goog"
-        "labs.google"
-        "notebooklm.google"
-        "notebooklm.google.com"
-        "copilot.microsoft.com"
-        "sydney.bing.com"
-        "edgeservices.bing.com"
-        "api.spotify.com"
-        "xpui.app.spotify.com"
-        "appresolve.spotify.com"
-        "login5.spotify.com"
-        "gew1-spclient.spotify.com"
-        "spclient.wg.spotify.com"
-        "api-partner.spotify.com"
-        "aet.spotify.com"
-        "www.spotify.com"
-        "accounts.spotify.com"
-        "claude.ai"
-        "www.notion.so"
-        "www.intel.com"
-      ];
-      "204.12.192.219" = [
-        "android.chat.openai.com"
-        "aisandbox-pa.googleapis.com"
-      ];
-      "204.12.192.221" = [
-        "operator.chatgpt.com"
-        "alkalimakersuite-pa.clients6.google.com"
-        "assistant-s3-pa.googleapis.com"
-        "rewards.bing.com"
-      ];
-      "50.7.87.85" = [
-        "proactivebackend-pa.googleapis.com"
-        "codeium.com"
-      ];
-      "50.7.85.221" = [
-        "xsts.auth.xboxlive.com"
-        "api.individual.githubcopilot.com"
-      ];
-      "138.201.204.218" = [
-        "encore.scdn.co"
-        "ap-gew1.spotify.com"
-      ];
-      "50.7.87.84" = [
-        "login.app.spotify.com"
-        "api.github.com"
-      ];
+
+    # NetworkManager
+    networkmanager = {
+      enable = true;
+      #wifi.backend = "iwd";
+      dns = "systemd-resolved";
+    };
+    #wireless.iwd.enable = true;
+    nftables.enable = true;
+
+    # Disable non-NetworkManager.
+    useDHCP = false;
+
+    # Firewall
+    firewall = {
+      enable = true;
+      trustedInterfaces = [ "virbr0" ];
     };
   };
 
+  # DNS
+  services.resolved.enable = true;
+
+  # Bluetooth
+  hardware.bluetooth = {
+    enable = true;
+    package = pkgs.bluez5-experimental;
+    settings.General.Experimental = true;
+  };
+  services.blueman.enable = true;
+
+  # CUPS
+  services.printing.enable = true;
+
+  # iOS Connection
+  services.usbmuxd.enable = true;
+
+  # OpenSSH
+  services.openssh.enable = true;
+
+  # KDEconnect
+  programs.kdeconnect = {
+    enable = true;
+    package = pkgs.gnomeExtensions.gsconnect;
+  };
+
+  # Happ
+  programs.happ = {
+    enable = true;
+    tunMode.enable = true;
+  };
 
 
-  ##################
-  # Virtualisation #
-  ##################
-  programs.virt-manager.enable = true;
+  # Virtualisation
   virtualisation = {
-    spiceUSBRedirection.enable = true;
-    docker = {
+    # Podman
+    podman = {
       enable = true;
-      storageDriver = "zfs";
+      dockerCompat = true; 
     };
+
+    # Libvirt
     libvirtd = {
       enable = true;
+      onBoot = "ignore";
+      onShutdown = "shutdown";
+      firewallBackend = "nftables";
+      # KVMFR
+      qemu.verbatimConfig = ''
+        namespaces = []
+        cgroup_device_acl = [
+          "/dev/null", "/dev/full", "/dev/zero",
+          "/dev/random", "/dev/urandom",
+          "/dev/ptmx", "/dev/kvm", "/dev/kqemu",
+          "/dev/rtc", "/dev/hpet", "/dev/vfio/vfio",
+          "/dev/kvmfr0"
+        ];
+      '';
     };
-  };  
+ 
+    # Spice
+    spiceUSBRedirection.enable = true;
+  };
+
+  # Virt-Manager
+  programs.virt-manager.enable = true; 
+ 
+  # KVMFR
+  services.udev.packages = lib.singleton (pkgs.writeTextFile
+    {
+      name = "kvmfr";
+      text = ''
+        SUBSYSTEM=="kvmfr", GROUP="kvm", MODE="0660", TAG+="uaccess"
+      '';
+      destination = "/etc/udev/rules.d/70-kvmfr.rules";
+    }
+  );
 
 
-
-
-  #########
-  # Sound #
-  #########
+  # PipeWire
   services = {
-    pulseaudio.enable = false;
     pipewire = {
       enable = true;
       pulse.enable = true;
       alsa.enable = true;
       audio.enable = true;
-      jack.enable = true;
       wireplumber.enable = true;
+      extraConfig.pipewire = {
+        # Disable resampling to get better quality.
+        "20-no-resampling" = {
+          "context.properties" = {
+            "default.clock.rate" = 48000;
+            "default.clock.allowed-rates" = [ 44100 48000 96000 192000 ];
+          };
+        };
+        # Adjust min buffer size to eliminate noise under load.
+        "10-sound" = {
+          "context.properties" = {
+            "default.clock.quantum" = 4096;
+            "default.clock.min-quantum" = 512;
+            "default.clock.max-quantum" = 8192;
+          };
+        };
+      };
     };
+    pulseaudio.enable = false;
   };
+  security.rtkit.enable = true;
+  environment.variables.AE_SINK = "ALSA";
+  environment.variables.SDL_AUDIODRIVER = "pipewire";
+  environment.variables.ALSOFT_DRIVERS = "pipewire";
 
 
-
-
- ############
- # Security #
- ############
- security = {
-    apparmor = {
-      enable = true;
-    };
+  # Security
+  security = {
+    # AppArmor
+    apparmor.enable = true;
+    # Google Authenticator
+    pam.services.sshd.googleAuthenticator.enable = true;
+    # Sudo
     polkit.enable = true;
     sudo = {
       enable = true;
-      execWheelOnly = true; 
+      execWheelOnly = true;
       wheelNeedsPassword = false;
     };
   };
- 
- programs = {
-    #mtr.enable = true;
-    #gnupg.agent.enable = true;
-    seahorse.enable = true;
+
+  # Keyring
+  programs.seahorse.enable = true;
+  programs.gnupg.agent = {
+    enable = true;
+    enableSSHSupport = true;
   };
 
-
-
-  
-  ############
-  # Services #
-  ############
+  # Services
   services = {
-    flatpak.enable = true;
-    printing.enable = true;
+    # OOM Killer
+    earlyoom.enable = true;
+    # irqbalance
     irqbalance.enable = true;
-    fwupd.enable = true; 
-    dbus.implementation = "broker";   
+    # DBus
+    dbus.implementation = "broker";
+    # Ananicy
     ananicy = {
       enable = true;
       package = pkgs.ananicy-cpp;
-      rulesProvider = pkgs.ananicy-rules-cachyos_git;
-    };
-    zfs = {
-      autoScrub.enable = true;
-      trim.enable = true;
+      rulesProvider = pkgs.ananicy-rules-cachyos_git; # Change to _git if using chaotic-nyx.
     };
   };
 
+  # ZRAM
   zramSwap = {
     enable = true;
     algorithm = "zstd";
     memoryPercent = 25;
+    priority = 100;
   };
 
+  boot.kernel.sysctl = {
+    "vm.swappiness" = 60;
+    "vm.page-cluster" = 0;
+  };
+
+  # OpenTabletDriver
   hardware.opentabletdriver.enable = true;
 
-  systemd.oomd = {
-    enable = true;
-    enableRootSlice = true;
-    enableSystemSlice = true;
-    enableUserSlices = true;
-  };
 
-
-
-  ########
-  # User #
-  ########
-  users.users.wenemous = {
+  # Users
+  users.users.rscape = {
     isNormalUser = true;
-    description = "Wenemous Turnip";
+    description = "Reinascape";
     uid = 1000;
-    extraGroups = [ "wheel" "docker" "input" "kvm" "libvirt" "storage" "video" "audio"  "networkmanager" ];
-    packages = with pkgs; [
-      tree
-      fastfetch
-      telegram-desktop
-      google-chrome
-      github-desktop
-      easyeffects
-      gnome-tweaks
-      clapper
-      firefox    
+    extraGroups = [ 
+      "wheel"
+      "users" 
+      "input" 
+      "storage" 
+      "video"
+      "audio"
+      "networkmanager" 
+      "adbusers"
+      "systemd-journal"
+
+      # Virtualisation
+      "docker"
+      "libvirt"
+      "libvirtd"
+      "kvm"
     ];
   };
 
-  nixpkgs.overlays = [
-    (final: prev: {
-      google-chrome = prev.google-chrome.override {
-        commandLineArgs = [
-          "--enable-features=TouchpadOverscrollHistoryNavigation"
-        ];
-      };
-    })
+
+  # Packages
+  environment = {
+    systemPackages = with pkgs; [
+      # GNOME-related
+      adw-gtk3
+      morewaita-icon-theme
+
+      # Android-related
+      android-tools
+      payload-dumper-go
+
+      # Files
+      unzip
+      unrar
+      zip
+      p7zip
+
+      # Tools
+      gh
+      wget
+
+      # System
+      sbctl
+      libsecret
+    ];
+  };
+
+  # User packages
+  users.users.rscape.packages = with pkgs; [
+    tree
+    gnome-tweaks
+    fastfetch
+    looking-glass-client
+    libreoffice    
+
+    # Development
+    github-desktop
+    python3
+    zed-editor
+    distrobox
+
+    # Media
+    file-roller
+    clapper
+    clapper-enhancers
+
+    # Web
+    telegram-desktop
+    tor-browser
+
+    # Chrome
+    (google-chrome.override { commandLineArgs = [ 
+      "--enable-features=TouchpadOverscrollHistoryNavigation,WebRtcHideLocalIpsWithMdns,Vulkan,SkiaGraphite,VaapiVideoEncoder,AcceleratedVideoDecodeLinuxGL,VaapiIgnoreDriverChecks"
+      "--enable-zero-copy"
+      "--enable-gpu-rasterization"
+      "--ignore-gpu-blocklist"
+      "--use-vulkan"
+      "--use-angle=vulkan"
+      "--enable-skia-graphite" 
+    ]; })
   ];
 
+  programs = {
+    # ccache
+    ccache.enable = true;
+    # GameMode
+    gamemode.enable = true;
+    # Firefox
+    firefox.enable = true;
+    # Git
+    git.enable = true;
+    git.lfs.enable = true;
+    # Neovim
+    neovim.enable = true;
+  };
 
-  #################
-  # Nixos-related #
-  #################
+  # Flatpak
+  services.flatpak.enable = true;
+
+  # NixOS/Nix
   nixpkgs.config.allowUnfree = true;
-  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+  nix.package = pkgs.nixVersions.latest;
+  # Tank more of my internet connection.
+  nix.extraOptions = ''
+    max-substitution-jobs = 30
+    http-connections = 50
+  '';
+  # Automatically removes NixOS' older builds.
+  nix.gc = {
+    automatic = true;
+    dates = "weekly";
+    options = "--delete-older-than 7d";
+  };
+  nix.settings = {
+    experimental-features = [ "nix-command" "flakes" ];
+    trusted-users = [ "root" "rscape" ];
+    
+    # More caches
+    substituters = [ "https://nix-community.cachix.org/" ];
+    trusted-public-keys = [
+      "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
+    ];
+
+    # Deduplication
+    auto-optimise-store = true;
+
+    # Use all cores for building.
+    max-jobs = "auto";
+  };
   environment.sessionVariables.NIXOS_OZONE_WL = "1";
 
 
-
-  ############
-  # Packages #
-  ############
-  environment = {
-    systemPackages = with pkgs; [
-
-    # # # # # #
-    # Non-gui #
-    # # # # # #
-    vim
-    sbctl
-    adw-gtk3
-    morewaita-icon-theme
-    libsecret
-    wget
-    git
-    zfs_cachyos
-    android-tools
-    payload-dumper-go
-    unzip
-    zip
-
-    # # # #
-    # Gui #
-    # # # #
-  
-    ];
-  };
-
-
-
-
-  ##################
-  # Do not touch!! #
-  ##################
-  system.stateVersion = "25.05"; # Do not touch!!
+  # This option defines the first version of NixOS you have installed on this particular machine,
+  # and is used to maintain compatibility with application data (e.g. databases) created on older NixOS versions.
+  #
+  # Most users should NEVER change this value after the initial install, for any reason,
+  # even if you've upgraded your system to a new NixOS release.
+  #
+  # This value does NOT affect the Nixpkgs version your packages and OS are pulled from,
+  # so changing it will NOT upgrade your system - see https://nixos.org/manual/nixos/stable/#sec-upgrading for how
+  # to actually do that.
+  #
+  # This value being lower than the current NixOS release does NOT mean your system is
+  # out of date, out of support, or vulnerable.
+  #
+  # Do NOT change this value unless you have manually inspected all the changes it would make to your configuration,
+  # and migrated your data accordingly.
+  #
+  # For more information, see `man configuration.nix` or https://nixos.org/manual/nixos/stable/options#opt-system.stateVersion .
+  system.stateVersion = "26.05"; # Did you read the comment?
 
 }
-
