@@ -8,37 +8,56 @@
     [ (modulesPath + "/installer/scan/not-detected.nix")
     ];
 
-  boot.initrd.availableKernelModules = [ "xhci_pci" "thunderbolt" "nvme" "usbhid" "usb_storage" "sd_mod" "rtsx_pci_sdmmc" "xe" ];
+  boot.initrd.availableKernelModules = [ "xhci_pci" "thunderbolt" "nvme" "usbhid" "usb_storage" "sd_mod" "rtsx_pci_sdmmc" ];
   boot.initrd.kernelModules = [ ];
   boot.kernelModules = [ "kvm-intel" ];
   boot.extraModulePackages = [ ];
 
   fileSystems."/" =
-    { device = "rpool/root";
-      fsType = "zfs";
+    { device = "/dev/disk/by-label/NIXOS";
+      fsType = "btrfs";
+      options = [ "subvol=@" "ssd" "noatime" "compress=zstd:1" "space_cache=v2" "autodefrag" "discard=async" ];
+    };
+
+  fileSystems."/nix" =
+    { device = "/dev/disk/by-uuid/fbe2dc50-a84a-45c6-ac30-8e2849ad37b9";
+      fsType = "btrfs";
+      options = [ "subvol=@nix" "ssd" "noatime" "compress=zstd:1" "space_cache=v2" "autodefrag" "discard=async" "nodev" "nosuid" ];
+    };
+
+  fileSystems."/persist" =
+    { device = "/dev/disk/by-uuid/fbe2dc50-a84a-45c6-ac30-8e2849ad37b9";
+      fsType = "btrfs";
+      options = [ "subvol=@persist" "ssd" "noatime" "compress=zstd:1" "space_cache=v2" "autodefrag" "discard=async" "nodev" ];
+      neededForBoot = true;
+    };
+
+  fileSystems."/var/log" =
+    { device = "/dev/disk/by-uuid/fbe2dc50-a84a-45c6-ac30-8e2849ad37b9";
+      fsType = "btrfs";
+      options = [ "subvol=@log" "ssd" "noatime" "compress=zstd:1" "space_cache=v2" "autodefrag" "discard=async" "nodev" "nosuid" "noexec" ];
+      neededForBoot = true;
+    };
+
+  fileSystems."/android" =
+    { device = "/dev/disk/by-uuid/fbe2dc50-a84a-45c6-ac30-8e2849ad37b9";
+      fsType = "btrfs";
+      options = [ "subvol=@android" "ssd" "noatime" "compress=zstd:1" "space_cache=v2" "autodefrag" "discard=async" "nodev" "nosuid" ];
     };
 
   fileSystems."/home" =
-    { device = "rpool/home";
-      fsType = "zfs";
+    { device = "/dev/disk/by-uuid/fbe2dc50-a84a-45c6-ac30-8e2849ad37b9";
+      fsType = "btrfs";
+      options = [ "subvol=@home" "ssd" "noatime" "compress=zstd:1" "space_cache=v2" "autodefrag" "discard=async" "nodev" ];
     };
 
   fileSystems."/boot" =
-    { device = "/dev/disk/by-uuid/B3C4-53F3";
+    { device = "/dev/disk/by-uuid/0B8E-D1DD";
       fsType = "vfat";
-      options = [ "fmask=0077" "dmask=0077" "nodev" "nosuid" ];
+      options = [ "fmask=0137" "dmask=0027" "nodev" "nosuid" "noexec" ];
     };
 
   swapDevices = [ ];
-
-  # Enables DHCP on each ethernet and wireless interface. In case of scripted networking
-  # (the default) this is the recommended approach. When using systemd-networkd it's
-  # still possible to use this option, but it's recommended to use it in conjunction
-  # with explicit per-interface declarations with `networking.interfaces.<interface>.useDHCP`.
-  networking.useDHCP = lib.mkDefault true;
-  networking.hostId = "abcd1234";
-  # networking.interfaces.enp47s0.useDHCP = lib.mkDefault true;
-  # networking.interfaces.wlp45s0.useDHCP = lib.mkDefault true;
 
   nixpkgs.hostPlatform = lib.mkDefault "x86_64-linux";
   hardware.cpu.intel.updateMicrocode = lib.mkDefault config.hardware.enableRedistributableFirmware;
